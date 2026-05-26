@@ -7,6 +7,7 @@ import { fetchMacedoniaCameras } from './macedonia';
 import { fetchTurkeyCameras } from './turkey';
 import { fetchRomaniaCameras } from './romania';
 import { fetchAustraliaCameras } from './australia';
+import { fetchUkCameras } from './uk';
 
 /**
  * OSIRIS — Worldwide CCTV Camera API v2
@@ -16,25 +17,6 @@ import { fetchAustraliaCameras } from './australia';
  */
 
 // ═══ CAMERA SOURCE DEFINITIONS ═══
-
-// ── UK: Transport for London JamCams (~900) ──
-async function fetchTfLCameras(): Promise<any[]> {
-  try {
-    const res = await fetch('https://api.tfl.gov.uk/Place/Type/JamCam', { signal: AbortSignal.timeout(12000) });
-    if (!res.ok) return [];
-    const data = await res.json();
-    return (data || []).map((cam: any) => {
-      const imgProp = cam.additionalProperties?.find((p: any) => p.key === 'imageUrl');
-      const camId = cam.id?.replace('JamCams_', '') || '';
-      return {
-        id: `tfl-${cam.id}`, lat: cam.lat, lng: cam.lon,
-        name: cam.commonName || 'London JamCam', city: 'London', country: 'UK',
-        feed_url: imgProp?.value || `https://s3-eu-west-1.amazonaws.com/jamcams.tfl.gov.uk/${camId}.jpg`,
-        source: 'TfL',
-      };
-    }).filter((c: any) => c.lat && c.lng);
-  } catch { return []; }
-}
 
 // ── US-WEST: WSDOT Washington State (~500) ──
 async function fetchWSDOTCameras(): Promise<any[]> {
@@ -275,7 +257,7 @@ async function fetchAsiaCameras(): Promise<any[]> {
 
 // ═══ REGION MAPPING ═══
 const REGION_FETCHERS: Record<string, () => Promise<any[]>> = {
-  'uk': fetchTfLCameras,
+  'uk': async () => (await fetchUkCameras()).cameras,
   'us-west': async () => [...await fetchWSDOTCameras(), ...await fetchCaltransCameras()],
   'us-east': fetchUSEastCameras,
   'us-central': fetchUSCentralCameras,
@@ -353,15 +335,40 @@ export async function GET(request: Request) {
     }
 
     const results = await Promise.allSettled(
-      regionsToFetch.map(r => REGION_FETCHERS[r]())
+      regionsToFetch.map(async (r) => {
+        if (r === 'uk') {
+          const ukResult = await fetchUkCameras(
+            lat !== 0 || lng !== 0 ? { lat, lng, radius } : undefined
+          );
+
+          return {
+            region: r,
+            cameras: ukResult.cameras,
+            source_health: ukResult.health,
+          };
+        }
+
+        return {
+          region: r,
+          cameras: await REGION_FETCHERS[r](),
+        };
+      })
     );
 
     const allCameras: any[] = [];
     const sources: Record<string, number> = {};
+    let sourceHealth: Record<string, any> | undefined;
 
     for (const result of results) {
       if (result.status === 'fulfilled') {
-        for (const cam of result.value) {
+        if (result.value.source_health) {
+          sourceHealth = {
+            ...(sourceHealth || {}),
+            ...result.value.source_health,
+          };
+        }
+
+        for (const cam of result.value.cameras) {
           allCameras.push(cam);
           sources[cam.source] = (sources[cam.source] || 0) + 1;
         }
@@ -374,6 +381,7 @@ export async function GET(request: Request) {
       sources,
       regions: regionsToFetch,
       timestamp: new Date().toISOString(),
+      ...(sourceHealth ? { source_health: sourceHealth } : {}),
     }, {
       headers: { 'Cache-Control': 'public, s-maxage=300, stale-while-revalidate=600' },
     });
